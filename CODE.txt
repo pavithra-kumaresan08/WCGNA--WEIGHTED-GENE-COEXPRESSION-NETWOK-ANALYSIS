@@ -1,0 +1,569 @@
+# 1️⃣ Load libraries and prepare data
+# =========================================
+library(DESeq2)
+library(WGCNA)
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()  # use all CPU cores
+
+# -----------------------------------------
+# Read counts and sample info
+# -----------------------------------------
+counts <- read.csv("counts.csv", row.names = 1)
+
+sample_info <- data.frame(
+  strain = c(
+    "Susceptible","Susceptible",   # SC1 SC2
+    "Susceptible","Susceptible","Susceptible",  # ST1 ST2 ST3
+    "Resistant","Resistant","Resistant",        # RC1 RC2 RC3
+    "Resistant","Resistant","Resistant"         # RT1 RT2 RT3
+  ),
+  treatment = c(
+    "Control","Control",   # SC1 SC2
+    "Treated","Treated","Treated",   # ST1 ST2 ST3
+    "Control","Control","Control",   # RC1 RC2 RC3
+    "Treated","Treated","Treated"    # RT1 RT2 RT3
+  )
+)
+rownames(sample_info) <- colnames(counts)
+
+# =========================================
+# 2️⃣ DESeq2 VST normalization + DEG (needed later)
+# =========================================
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData = sample_info,
+  design = ~ strain + treatment
+)
+
+dds <- estimateSizeFactors(dds)
+vsd <- vst(dds, blind = TRUE)
+
+# Run DESeq2 for DEG list (required later)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("strain", "Resistant", "Susceptible"))
+resistance_DEG <- as.data.frame(res)
+
+datExpr <- t(assay(vsd))  # samples x genes
+
+# Save VST data for reference
+write.csv(datExpr, "VST_expression_for_WGCNA.csv", quote=FALSE)
+write.csv(sample_info, "sample_traits_for_WGCNA.csv", quote=FALSE)
+
+# =========================================
+# 3️⃣ Filter genes and check samples
+# =========================================
+gsg <- goodSamplesGenes(datExpr, verbose=3)
+if (!gsg$allOK) {
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+# Filter low-variance genes (variance > 0.1) — YOUR THRESHOLD KEPT
+geneVar <- apply(datExpr, 2, var)
+datExpr <- datExpr[, geneVar > 0.1]
+
+# Check dimensions
+dim(datExpr)
+
+# =========================================
+# 4️⃣ Sample clustering (dendrogram)
+# =========================================
+sampleTree <- hclust(dist(datExpr), method="average")
+
+graphics.off()
+par(mfrow=c(1,1), mar=c(5,5,4,2))
+
+pdf("SampleClustering_Dendrogram.pdf", width=12, height=6)
+plot(sampleTree, main="Sample Clustering to Detect Outliers", sub="", xlab="", cex.lab=1.5)
+dev.off()
+
+png("SampleClustering_Dendrogram.png", width=2500, height=1500, res=300)
+plot(sampleTree, main="Sample Clustering to Detect Outliers", sub="", xlab="", cex.lab=1.5)
+dev.off()
+
+# =========================================
+# 5️⃣ Pick soft-threshold
+# =========================================
+powers <- 1:20
+sft <- pickSoftThreshold(datExpr, powerVector=powers, networkType="signed", verbose=5)
+
+pdf("SoftThreshold_Plot.pdf", width=12, height=6)
+par(mar=c(5,5,4,2))
+plot(sft$fitIndices[,1],
+     -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",
+     ylab="Scale Free Topology Model Fit, signed R^2",
+     type="n")
+text(sft$fitIndices[,1],
+     -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers, col="red")
+abline(h=0.85, col="blue", lty=2)
+dev.off()
+
+png("SoftThreshold_Plot.png", width=2500, height=1500, res=300)
+par(mar=c(5,5,4,2))
+plot(sft$fitIndices[,1],
+     -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",
+     ylab="Scale Free Topology Model Fit, signed R^2",
+     type="n")
+text(sft$fitIndices[,1],
+     -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers, col="red")
+abline(h=0.85, col="blue", lty=2)
+dev.off()
+
+# YOUR CHOSEN POWER (UNCHANGED)
+softPower <- 12  
+
+# =========================================
+# 6️⃣ Network construction & module detection
+# =========================================
+net <- blockwiseModules(
+  datExpr,
+  power = softPower,
+  TOMType = "signed",
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = FALSE,
+  pamRespectsDendro = FALSE,
+  verbose = 3
+)
+
+moduleColors <- net$colors
+names(moduleColors) <- colnames(datExpr)
+
+MEs <- net$MEs
+
+pdf("ModuleDendrogram_Colors.pdf", width=15, height=6)
+par(mar=c(5,5,4,2))
+plotDendroAndColors(net$dendrograms[[1]],
+                    moduleColors[net$blockGenes[[1]]],
+                    "Module colors", dendroLabels=FALSE)
+dev.off()
+
+png("ModuleDendrogram_Colors.png", width=3000, height=1500, res=300)
+par(mar=c(5,5,4,2))
+plotDendroAndColors(net$dendrograms[[1]],
+                    moduleColors[net$blockGenes[[1]]],
+                    "Module colors", dendroLabels=FALSE)
+dev.off()
+
+# 7️⃣ Eigengene dendrogram with colors
+# =========================================
+
+# Calculate eigengene dissimilarity
+MEDiss <- 1 - cor(MEs, use = "pairwise.complete.obs")
+
+# Cluster eigengenes
+METree <- hclust(as.dist(MEDiss), method = "average")
+
+# Convert module colors to eigengene colors
+MEColors <- labels2colors(
+  as.numeric(factor(colnames(MEs))),
+  colorSeq = moduleColors
+)
+
+# --------- PDF plot ----------
+pdf("EigengeneDendrogram_Colors.pdf", width = 12, height = 6)
+par(mar = c(5,5,4,2))
+
+plot(METree,
+     main = "Eigengene Dendrogram",
+     xlab = "",
+     sub = "")
+
+# Add color bars below dendrogram
+plotEigengeneNetworks(
+  MEs,
+  "Eigengene adjacency heatmap",
+  marDendro = c(3,3,2,4),
+  marHeatmap = c(3,4,2,2),
+  cex.lab = 0.8,
+  cex.axis = 0.7,
+  cex.main = 1.2
+)
+
+dev.off()
+# --------- PNG plot ----------
+png("EigengeneDendrogram_Colors.png",
+    width = 2500, height = 1500, res = 300)
+
+par(mar = c(5,5,4,2))
+
+plot(METree,
+     main = "Eigengene Dendrogram",
+     xlab = "",
+     sub = "")
+
+plotEigengeneNetworks(
+  MEs,
+  "Eigengene adjacency heatmap",
+  marDendro = c(3,3,2,4),
+  marHeatmap = c(3,4,2,2),
+  cex.lab = 0.8,
+  cex.axis = 0.7,
+  cex.main = 1.2
+)
+
+dev.off()
+# =========================================
+# 7️⃣ Module–Trait Relationships
+# =========================================
+
+# Trait data (Resistant = 1, Susceptible = 0)
+traitData <- data.frame(
+  strain = as.numeric(sample_info$strain == "Resistant")
+)
+rownames(traitData) <- rownames(datExpr)
+
+# Correlation and p-values
+moduleTraitCor <- cor(MEs, traitData, use = "p")
+moduleTraitP   <- corPvalueStudent(moduleTraitCor, nSamples = nrow(datExpr))
+
+# =========================================
+# Create text matrix: Correlation + (p-value)
+# =========================================
+textMatrix <- paste(
+  signif(moduleTraitCor, 3),
+  "\n(",
+  signif(moduleTraitP, 3),
+  ")",
+  sep = ""
+)
+dim(textMatrix) <- dim(moduleTraitCor)
+
+# =========================================
+# FULL MODULE HEATMAP (PDF)
+# =========================================
+pdf("ModuleTraitHeatmap_Full.pdf", width = 20, height = 20)
+par(mar = c(12, 12, 4, 2))
+
+labeledHeatmap(
+  Matrix = moduleTraitCor,
+  xLabels = names(traitData),
+  yLabels = names(MEs),
+  ySymbols = names(MEs),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  main = "Module–Trait Relationships (All Modules)"
+)
+dev.off()
+
+# =========================================
+# Select TOP 10 modules
+# =========================================
+topModules <- names(
+  sort(apply(abs(moduleTraitCor), 1, max), decreasing = TRUE)
+)[1:10]
+
+# Text matrix for top modules
+textMatrix_top10 <- paste(
+  signif(moduleTraitCor[topModules, , drop = FALSE], 3),
+  "\n(",
+  signif(moduleTraitP[topModules, , drop = FALSE], 3),
+  ")",
+  sep = ""
+)
+dim(textMatrix_top10) <- dim(moduleTraitCor[topModules, , drop = FALSE])
+
+# =========================================
+# TOP 10 MODULE HEATMAP (PDF)
+# =========================================
+pdf("ModuleTraitHeatmap_Top10Modules.pdf", width = 14, height = 15)
+par(mar = c(8, 8, 4, 2))
+
+labeledHeatmap(
+  Matrix = moduleTraitCor[topModules, , drop = FALSE],
+  xLabels = names(traitData),
+  yLabels = topModules,
+  ySymbols = topModules,
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix_top10,
+  main = "Module–Trait Relationships (Top 10 Modules)"
+)
+dev.off()
+
+# =========================================
+# FULL MODULE HEATMAP (PNG)
+# =========================================
+png("ModuleTraitHeatmap_Full.png", width = 2000, height = 2500, res = 200)
+par(mar = c(8, 8, 4, 2))
+
+labeledHeatmap(
+  Matrix = moduleTraitCor,
+  xLabels = names(traitData),
+  yLabels = names(MEs),
+  ySymbols = names(MEs),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  main = "Module–Trait Relationships (All Modules)"
+)
+dev.off()
+
+# =========================================
+# TOP 10 MODULE HEATMAP (PNG)
+# =========================================
+png("ModuleTraitHeatmap_Top10Modules.png", width = 1400, height = 1500, res = 200)
+par(mar = c(6, 6, 4, 2))
+
+labeledHeatmap(
+  Matrix = moduleTraitCor[topModules, , drop = FALSE],
+  xLabels = names(traitData),
+  yLabels = topModules,
+  ySymbols = topModules,
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix_top10,
+  main = "Module–Trait Relationships (Top 10 Modules)"
+)
+dev.off()
+
+
+
+# 8️⃣ Calculate kME and hub genes (ALL MODULES)
+# =========================================
+kME <- signedKME(datExpr, MEs)
+
+modules <- unique(moduleColors)
+hubGenes_all <- list()
+
+for(mod in modules){
+  genes_in_module <- colnames(datExpr)[
+    moduleColors == mod & abs(kME[, paste0("kME", mod)]) > 0.85
+  ]
+  hubGenes_all[[mod]] <- genes_in_module
+  
+  topHub <- head(genes_in_module, 20)
+  hub_kME <- abs(kME[topHub, paste0("kME", mod)])
+  
+  if(length(topHub) > 0){
+    pdf(paste0("TopHubGenes_Barplot_",mod,".pdf"), width=12, height=6)
+    par(mar=c(10,5,4,2))
+    barplot(hub_kME,
+            names.arg=topHub,
+            las=2,
+            col="steelblue",
+            main=paste("Top Hub Genes in", mod, "Module"),
+            cex.names=0.8)
+    dev.off()
+  }
+}
+
+hubGenes_df <- do.call(rbind, lapply(names(hubGenes_all), function(mod){
+  data.frame(Module=mod, Gene=hubGenes_all[[mod]])
+}))
+write.csv(hubGenes_df, "WGCNA_all_modules_hub_genes.csv", row.names=FALSE)
+
+
+# =========================================
+# 9️⃣ BLUE MODULE ANALYSIS (CORRECTED)
+# =========================================
+
+# Identify blue module genes
+blueGenes <- names(moduleColors)[moduleColors == "blue"]
+length(blueGenes)
+
+# --------- kME + GS (single consistent method) ----------
+MM <- kME[blueGenes, paste0("kME","blue")]
+GS <- cor(datExpr[, blueGenes], traitData$strain, use="p")
+
+blueRes <- data.frame(Gene=blueGenes, MM=MM, GS=GS)
+
+# Strong hub genes (YOUR THRESHOLDS)
+blueStrong <- blueRes[abs(blueRes$MM) > 0.9 & abs(blueRes$GS) > 0.8,]
+write.csv(blueStrong, "HighConfidence_Blue_Resistance.csv", row.names=FALSE)
+
+# ================================
+# MM vs GS scatter plot
+# ================================
+absMM <- abs(blueRes$MM)
+absGS <- abs(blueRes$GS)
+
+png("Blue_MM_vs_GS.png", 1600, 1200, res=200)
+plot(absMM, absGS,
+     xlab="Module Membership (kME)",
+     ylab="Gene Significance (GS)",
+     main="Blue Resistance Module",
+     pch=19, col=rgb(0,0.4,0.8,0.6))
+abline(h=0.8, col="red", lty=2)
+abline(v=0.9, col="red", lty=2)
+dev.off()
+
+pdf("Blue_MM_vs_GS.pdf", 8, 6)
+plot(absMM, absGS,
+     xlab="Module Membership (kME)",
+     ylab="Gene Significance (GS)",
+     main="Blue Resistance Module",
+     pch=19, col=rgb(0,0.4,0.8,0.6))
+abline(h=0.8, col="red", lty=2)
+abline(v=0.9, col="red", lty=2)
+dev.off()
+
+# ================================
+# Highlight final resistance genes
+# ================================
+degGenes <- rownames(resistance_DEG)[
+  resistance_DEG$padj < 0.05 & abs(resistance_DEG$log2FoldChange) > 1
+]
+
+finalResistanceGenes <- intersect(degGenes, blueStrong$Gene)
+
+png("Blue_MM_vs_GS_Highlight_FinalGenes.png", 1600, 1200, res=200)
+plot(blueRes$MM, blueRes$GS,
+     xlab="Module Membership (kME)",
+     ylab="Gene Significance (GS)",
+     main="Blue Resistance Module",
+     pch=16, col="lightblue")
+abline(v=0.9, h=0.8, col="red", lty=2)
+points(blueRes$MM[blueRes$Gene %in% finalResistanceGenes],
+       blueRes$GS[blueRes$Gene %in% finalResistanceGenes],
+       col="darkgreen", pch=19, cex=1.2)
+legend("bottomright", legend=c("All Blue Genes","Final Resistance Genes"),
+       col=c("lightblue","darkgreen"), pch=c(16,19))
+dev.off()
+
+# ================================ 
+# -----
+
+# =========================================
+# 🔟 TURQUOISE MODULE ANALYSIS (SAME AS BLUE)
+# =========================================
+
+# ----- Identify turquoise module genes -----
+turqGenes <- names(moduleColors)[moduleColors == "turquoise"]
+length(turqGenes)
+
+# --------- kME + GS (same method as blue) ----------
+MM_turq <- kME[turqGenes, paste0("kME","turquoise")]
+GS_turq <- cor(datExpr[, turqGenes], traitData$strain, use="p")
+
+turqRes <- data.frame(Gene = turqGenes,
+                      MM = MM_turq,
+                      GS = GS_turq)
+
+# Strong hub genes (same thresholds as blue)
+turqStrong <- turqRes[abs(turqRes$MM) > 0.9 & abs(turqRes$GS) > 0.8,]
+write.csv(turqStrong, "HighConfidence_Turquoise_Resistance.csv", row.names = FALSE)
+
+# ================================
+# MM vs GS scatter plot (Turquoise)
+# ================================
+
+absMM_turq <- abs(turqRes$MM)
+absGS_turq <- abs(turqRes$GS)
+
+png("Turquoise_MM_vs_GS.png", 1600, 1200, res = 200)
+plot(absMM_turq, absGS_turq,
+     xlab = "Module Membership (kME)",
+     ylab = "Gene Significance (GS)",
+     main = "Turquoise Resistance Module",
+     pch = 19, col = rgb(0,0.6,0.4,0.6))
+abline(h = 0.8, col = "red", lty = 2)
+abline(v = 0.9, col = "red", lty = 2)
+dev.off()
+
+pdf("Turquoise_MM_vs_GS.pdf", 8, 6)
+plot(absMM_turq, absGS_turq,
+     xlab = "Module Membership (kME)",
+     ylab = "Gene Significance (GS)",
+     main = "Turquoise Resistance Module",
+     pch = 19, col = rgb(0,0.6,0.4,0.6))
+abline(h = 0.8, col = "red", lty = 2)
+abline(v = 0.9, col = "red", lty = 2)
+dev.off()
+
+# ================================
+# Highlight final resistance genes (Turquoise)
+# ================================
+
+finalResistanceGenes_turq <- intersect(degGenes, turqStrong$Gene)
+
+png("Turquoise_MM_vs_GS_Highlight_FinalGenes.png", 1600, 1200, res = 200)
+
+plot(turqRes$MM, turqRes$GS,
+     xlab = "Module Membership (kME)",
+     ylab = "Gene Significance (GS)",
+     main = "Turquoise Resistance Module",
+     pch = 16, col = "lightblue")
+
+abline(v = 0.9, h = 0.8, col = "red", lty = 2)
+
+points(turqRes$MM[turqRes$Gene %in% finalResistanceGenes_turq],
+       turqRes$GS[turqRes$Gene %in% finalResistanceGenes_turq],
+       col = "darkgreen", pch = 19, cex = 1.2)
+
+legend("bottomright",
+       legend = c("All Turquoise Genes","Final Resistance Genes"),
+       col = c("lightblue","darkgreen"),
+       pch = c(16,19))
+
+dev.off()
+
+
+
+
+blueStrong$Module <- "blue"
+turqStrong$Module <- "turquoise"
+
+
+allStrong <- rbind(blueStrong, turqStrong)
+
+write.csv(allStrong, "both_Modules_Strong_HubGenes.csv", row.names = FALSE)
+
+library(igraph)
+
+TOM <- TOMsimilarityFromExpr(
+  datExpr,
+  power = softPower,
+  TOMType = "signed"
+)
+
+colnames(TOM) <- rownames(TOM) <- colnames(datExpr)
+
+
+blueHC_genes  <- blueStrong$Gene
+turqHC_genes  <- turqStrong$Gene
+
+TOM_blue_HC <- TOM[blueHC_genes, blueHC_genes]
+
+# Optional: remove weak edges
+TOM_blue_HC[TOM_blue_HC < 0.2] <- 0
+TOM_turq_HC <- TOM[turqHC_genes, turqHC_genes]
+
+TOM_turq_HC[TOM_turq_HC < 0.2] <- 0
+
+library(igraph)
+
+blue_graph <- graph_from_adjacency_matrix(
+  TOM_blue_HC,
+  mode = "undirected",
+  weighted = TRUE,
+  diag = FALSE
+)
+
+blue_graph <- simplify(blue_graph)
+
+blue_graph
+
+turq_graph <- graph_from_adjacency_matrix(
+  TOM_turq_HC,
+  mode = "undirected",
+  weighted = TRUE,
+  diag = FALSE
+)
+
+turq_graph <- simplify(turq_graph)
+
+turq_graph
+
+write_graph(blue_graph,
+            file = "Blue_HighConfidence_Network.graphml",
+            format = "graphml")
+
+write_graph(turq_graph,
+            file = "Turquoise_HighConfidence_Network.graphml",
+            format = "graphml")
