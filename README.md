@@ -1,8 +1,11 @@
 # WCGNA--WEIGHTED-GENE-COEXPRESSION-NETWOK-ANALYSIS
 This repository contains an R-based workflow integrating RNA-seq normalization, differential gene expression (DEG) analysis, and Weighted Gene Co-expression Network Analysis (WGCNA) to identify high-confidence chlorantraniliprole resistance–associated genes 
 Overview of the Analysis Pipeline
+
 RNA-seq Count Data and Sample Metadata Preparation
+
 Experimental Design: Strain and Treatment Classification
+
 Variance Stabilizing Transformation (VST) for Network Analysis
 Differential Gene Expression Analysis Using DESeq2
 Identification of Resistance-Associated DEGs
